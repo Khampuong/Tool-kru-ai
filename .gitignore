@@ -1,0 +1,8 @@
+node_modules/
+data/
+*.log
+# ข้อมูลส่วนบุคคลของผู้เชี่ยวชาญ (ชื่อ อีเมล เบอร์โทร) — ไม่นำขึ้น GitHub
+Tool-research/*.xlsx
+Tool-research/*.xls
+Tool-research/*.csv
+~$*

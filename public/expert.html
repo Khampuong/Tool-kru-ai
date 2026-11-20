@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>แบบประเมินสำหรับผู้เชี่ยวชาญ</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="container" id="app"><p class="muted">กำลังโหลดแบบประเมิน…</p></div>
+  <div class="bottom-bar no-print hidden" id="bar">
+    <div class="row" style="flex:1;min-width:220px">
+      <div class="progress" style="flex:1;max-width:260px"><span id="prog" style="width:0"></span></div>
+      <span class="small" id="progText"></span>
+      <span class="small muted" id="saveState"></span>
+    </div>
+    <div class="row" id="barActions"></div>
+  </div>
+  <script src="/static/common.js"></script>
+  <script src="/static/signature.js"></script>
+  <script src="/static/expert.js"></script>
+</body>
+</html>
