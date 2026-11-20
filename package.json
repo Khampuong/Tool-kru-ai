@@ -1,0 +1,19 @@
+{
+  "name": "tool-kru-ai-expert-eval",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ระบบประเมินเครื่องมือวิจัยโดยผู้เชี่ยวชาญ (IOC / ความเหมาะสม) พร้อมลงนามอิเล็กทรอนิกส์",
+  "main": "server.js",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+  },
+  "dependencies": {
+    "docx": "^9.5.1",
+    "exceljs": "^4.4.0",
+    "express": "^4.21.2"
+  }
+}
