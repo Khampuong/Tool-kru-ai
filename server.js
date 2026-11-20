@@ -202,9 +202,45 @@ app.get('/api/expert/me', (req, res) => {
   const e = expertSession(req);
   if (!e) return res.json({ expert: null });
   res.json({
-    expert: { id: e.id, name: e.name, position: e.position, workplace: e.workplace, email: e.email },
+    expert: {
+      id: e.id, name: e.name, position: e.position, workplace: e.workplace, experience: e.experience,
+      expertise: e.expertise, email: e.email, phone: e.phone,
+    },
+    experienceOptions: store.getSettings().experienceOptions || [],
     assignments: store.expertAssignments(e.id),
   });
+});
+/** ผู้เชี่ยวชาญแก้ไขข้อมูลส่วนตัวของตนเอง */
+app.put('/api/expert/profile', (req, res) => {
+  const e = expertSession(req);
+  if (!e) throw httpError(401, 'กรุณาเข้าสู่ระบบ');
+  const b = req.body || {};
+  const v = {
+    name: String(b.name ?? '').trim().slice(0, 200),
+    position: String(b.position ?? '').trim().slice(0, 300),
+    workplace: String(b.workplace ?? '').trim().slice(0, 300),
+    experience: String(b.experience ?? '').trim().slice(0, 100),
+    expertise: String(b.expertise ?? '').trim().slice(0, 300),
+    email: String(b.email ?? '').trim().slice(0, 200),
+    phone: String(b.phone ?? '').replace(/[\s-]/g, ''),
+  };
+  if (!v.name) throw httpError(400, 'กรุณากรอกชื่อ-นามสกุล');
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(v.email)) throw httpError(400, 'กรุณากรอกอีเมลให้ถูกต้อง');
+  if (!/^\d{10}$/.test(v.phone)) throw httpError(400, 'เบอร์โทรศัพท์ต้องเป็นตัวเลข 10 หลัก');
+  const clash = db
+    .prepare('SELECT id FROM experts WHERE id<>? AND password_hash IS NOT NULL AND (lower(trim(email))=? OR phone=?)')
+    .get(e.id, v.email.toLowerCase(), v.phone);
+  if (clash) throw httpError(409, 'อีเมลหรือเบอร์โทรศัพท์นี้ถูกใช้กับบัญชีอื่นแล้ว');
+  const before = { name: e.name, position: e.position, workplace: e.workplace, experience: e.experience, expertise: e.expertise, email: e.email, phone: e.phone };
+  store.tx(() => {
+    db.prepare('UPDATE experts SET name=?, position=?, workplace=?, experience=?, expertise=?, email=?, phone=? WHERE id=?')
+      .run(v.name, v.position, v.workplace, v.experience, v.expertise, v.email, v.phone, e.id);
+    // ปรับตอนที่ 1 ของแบบประเมินที่ยังไม่ลงนาม (ฉบับที่ลงนามแล้วคงข้อมูลเดิมไว้)
+    const prof = JSON.stringify({ name: v.name, position: v.position, workplace: v.workplace, experience: v.experience });
+    db.prepare("UPDATE assignments SET profile=? WHERE expert_id=? AND status<>'submitted'").run(prof, e.id);
+  });
+  store.audit('expert', 'expert.profile', { id: e.id, before, after: v });
+  res.json({ ok: true });
 });
 app.post('/api/expert/password', (req, res) => {
   const e = expertSession(req);
