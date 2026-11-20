@@ -8,6 +8,16 @@ const STATUS = {
   submitted: ['ลงนามส่งแล้ว', 'ok'],
 };
 let settingsCache = null;
+/** ไอคอนประจำชุดเครื่องมือ (ตามระยะการวิจัย Smart Campus · IoB · Avatar · Happy Org) */
+const INST_ICON = {
+  '01': ['🏫', 'องค์ประกอบวิทยาลัยอัจฉริยะ · IoB · อวตาร'],
+  '02': ['😊', 'ตัวบ่งชี้องค์กรแห่งความสุข'],
+  '03': ['🧩', 'สถาปัตยกรรมระบบ'],
+  '04': ['🤖', 'แพลตฟอร์มและอวตารโอภาปราศรัย'],
+  '05': ['🧠', 'โมเดลการจัดการ'],
+  '06': ['💜', 'องค์กรแห่งความสุข'],
+  '07': ['⭐', 'ความพึงพอใจ'],
+};
 
 // ======================= boot & routing =======================
 (async function boot() {
@@ -49,6 +59,7 @@ async function showLogin() {
       names = await api('GET', '/api/public/experts');
     } catch { /* แสดงข้อความด้านล่าง */ }
     const panel = `
+      ${avatarGreet('ยินดีที่ได้รู้จัก 😊<span>กรอกข้อมูลเพียง 3 ขั้นตอน ก็พร้อมเริ่มประเมินได้เลย</span>')}
       <h2>กรอกข้อมูลเพื่อเข้าสู่ระบบ</h2>
       <p class="lead">สำหรับผู้เชี่ยวชาญที่เข้าใช้ครั้งแรก เลือกชื่อของท่าน กรอกอีเมล เบอร์โทรศัพท์ และตั้งรหัสผ่าน</p>
       <div class="reg-steps"><span class="on">1 เลือกชื่อ</span><span>2 กรอกข้อมูล</span><span>3 บันทึก</span></div>
@@ -124,8 +135,11 @@ async function showLogin() {
     if (loginRole === 'expert' && mode === 'register') return drawRegister();
     const isExp = loginRole === 'expert';
     const panel = `
-      <h2>ยินดีต้อนรับ</h2>
-      <p class="lead">${isExp ? 'เข้าสู่ระบบเพื่อประเมินเครื่องมือวิจัยที่ได้รับเชิญ' : 'เข้าสู่ระบบสำหรับผู้วิจัย / ผู้ดูแลระบบ'}</p>
+      ${avatarGreet(isExp
+        ? 'สวัสดี 🙏 ยินดีต้อนรับท่านผู้เชี่ยวชาญ<span>ขอบคุณที่ร่วมสร้างวิทยาลัยอัจฉริยะสู่องค์กรแห่งความสุข 💜</span>'
+        : 'สวัสดี 🙏 ยินดีต้อนรับผู้วิจัย<span>พร้อมดูภาพรวมการประเมินเครื่องมือแล้ว</span>')}
+      <h2>เข้าสู่ระบบ</h2>
+      <p class="lead">${isExp ? 'เข้าสู่ระบบเพื่อประเมินเครื่องมือวิจัยที่ได้รับเชิญ' : 'สำหรับผู้วิจัย / ผู้ดูแลระบบ'}</p>
       <div class="seg" role="tablist">
         <button type="button" role="tab" data-role="expert" class="${isExp ? 'on' : ''}" aria-selected="${isExp}">${ICON.user.replace('<svg', '<svg width="16" height="16"')} ผู้เชี่ยวชาญ</button>
         <button type="button" role="tab" data-role="admin" class="${isExp ? '' : 'on'}" aria-selected="${!isExp}">${ICON.lock.replace('<svg', '<svg width="16" height="16"')} ผู้ดูแลระบบ</button>
@@ -181,7 +195,62 @@ async function showLogin() {
 }
 
 // ======================= expert home =======================
-function showExpertHome({ expert, assignments }) {
+/** ผู้เชี่ยวชาญแก้ไขข้อมูลส่วนตัว */
+function editMyProfile(e, experienceOptions) {
+  const opts = [...new Set([...(experienceOptions || []), e.experience].filter(Boolean))];
+  return modal(
+    `${avatarGreet('อัปเดตข้อมูลของท่านได้ที่นี่ ✨<span>ข้อมูลจะแสดงในแบบประเมินที่ยังไม่ได้ลงนาม</span>', { size: 56 })}
+     <h2>แก้ไขข้อมูลส่วนตัว</h2>
+     <div class="auth-err" id="perr" role="alert"></div>
+     <form id="pf" class="grid cols-2" novalidate>
+       <div class="field" style="grid-column:1/-1"><label for="p-name">ชื่อ-นามสกุล (พร้อมคำนำหน้า/ตำแหน่งทางวิชาการ) *</label><input type="text" id="p-name" value="${esc(e.name)}" autocomplete="name"></div>
+       <div class="field"><label for="p-pos">ตำแหน่ง</label><input type="text" id="p-pos" value="${esc(e.position)}"></div>
+       <div class="field"><label for="p-work">สถานที่ทำงาน / สังกัด</label><input type="text" id="p-work" value="${esc(e.workplace)}"></div>
+       <div class="field"><label for="p-exp">ประสบการณ์การทำงาน</label><select id="p-exp"><option value="">— เลือก —</option>
+         ${opts.map((o) => `<option ${o === e.experience ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></div>
+       <div class="field"><label for="p-skill">ความเชี่ยวชาญ</label><input type="text" id="p-skill" value="${esc(e.expertise)}" placeholder="เช่น ด้านการบริหารการศึกษา"></div>
+       <div class="field"><label for="p-mail">อีเมล *</label><input type="email" id="p-mail" value="${esc(e.email)}" autocomplete="email"></div>
+       <div class="field"><label for="p-tel">เบอร์โทรศัพท์ (10 หลัก) *</label><input type="tel" id="p-tel" value="${esc(e.phone)}" inputmode="numeric" maxlength="10" autocomplete="tel"></div>
+     </form>
+     <div class="actions"><button data-close>ยกเลิก</button><button class="primary" id="psave">บันทึกข้อมูล</button></div>`,
+    {
+      onMount: (m, close) => {
+        const tel = $('#p-tel', m);
+        tel.addEventListener('input', () => (tel.value = tel.value.replace(/\D/g, '').slice(0, 10)));
+        const save = async () => {
+          const body = {
+            name: $('#p-name', m).value.trim(), position: $('#p-pos', m).value.trim(), workplace: $('#p-work', m).value.trim(),
+            experience: $('#p-exp', m).value, expertise: $('#p-skill', m).value.trim(),
+            email: $('#p-mail', m).value.trim(), phone: tel.value.trim(),
+          };
+          const bad =
+            (!body.name && ['p-name', 'กรุณากรอกชื่อ-นามสกุล']) ||
+            (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(body.email) && ['p-mail', 'กรุณากรอกอีเมลให้ถูกต้อง']) ||
+            (!/^\d{10}$/.test(body.phone) && ['p-tel', 'เบอร์โทรศัพท์ต้องเป็นตัวเลข 10 หลัก']);
+          if (bad) {
+            showErr($('#perr', m), bad[1]);
+            return $('#' + bad[0], m).focus();
+          }
+          const btn = $('#psave', m);
+          btn.disabled = true;
+          try {
+            await api('PUT', '/api/expert/profile', body);
+            try { if (localStorage.getItem('eval.login')) localStorage.setItem('eval.login', body.email); } catch { /* ไม่มี storage */ }
+            close(true);
+            toast('บันทึกข้อมูลส่วนตัวแล้ว');
+            showExpertHome(await api('GET', '/api/expert/me'));
+          } catch (err) {
+            btn.disabled = false;
+            showErr($('#perr', m), err.message);
+          }
+        };
+        $('#psave', m).addEventListener('click', save);
+        $('#pf', m).addEventListener('submit', (ev) => (ev.preventDefault(), save()));
+      },
+    }
+  );
+}
+function showExpertHome({ expert, assignments, experienceOptions = [] }) {
   document.title = 'การประเมินเครื่องมือ - ' + expert.name;
   const btn = (a) =>
     !a.active && a.status !== 'submitted'
@@ -190,9 +259,39 @@ function showExpertHome({ expert, assignments }) {
           a.status === 'submitted' ? 'ดูฉบับที่ลงนามแล้ว' : a.status === 'draft' ? 'ประเมินต่อ' : 'เริ่มประเมิน'
         }</a>`;
   view.innerHTML = `
-  <div class="row between" style="margin-bottom:16px">
-    <div><h1 style="margin:0">การประเมินเครื่องมือ</h1><div class="muted">${esc(expert.name)}${expert.position ? ' · ' + esc(expert.position) : ''}</div></div>
-    <div class="row"><button class="sm" id="chpw">เปลี่ยนรหัสผ่าน</button><button class="sm" id="exOut">ออกจากระบบ</button></div>
+  <div class="hello">
+    <div class="row between">
+      <div class="row" style="gap:16px;flex-wrap:nowrap"><div class="av-wrap hello-av">${AVATAR_SVG}</div>
+        <div><span class="hello-chip">อวตารโอภาปราศรัย · ยินดีต้อนรับ</span><h1>สวัสดี 🙏 ${esc(expert.name)}</h1>
+        <p>ขอบคุณที่ร่วมประเมินเครื่องมือวิจัย เพื่อวิทยาลัยอัจฉริยะสู่องค์กรแห่งความสุข 💜</p></div></div>
+      <div class="row"><button class="sm btn" id="chpw">🔑 เปลี่ยนรหัสผ่าน</button><button class="sm btn" id="exOut">ออกจากระบบ</button></div>
+    </div>
+    <div class="row" style="margin-top:14px;gap:8px">
+      ${(() => {
+        const done = assignments.filter((a) => a.status === 'submitted').length;
+        const pct = assignments.length ? Math.round((done / assignments.length) * 100) : 0;
+        return `<div class="progress" style="flex:1;max-width:340px;background:rgba(255,255,255,.25)"><span style="width:${pct}%"></span></div>
+          <span class="small">ส่งแล้ว ${done}/${assignments.length} ชุด</span>`;
+      })()}
+    </div>
+  </div>
+  <div class="card profile-card">
+    <div class="row between" style="margin-bottom:10px">
+      <h2 style="margin:0">👤 ข้อมูลส่วนตัว</h2>
+      <button class="sm primary" id="editProfile">✏️ แก้ไขข้อมูลส่วนตัว</button>
+    </div>
+    <div class="pf-grid">
+      ${[
+        ['ชื่อ-นามสกุล', expert.name],
+        ['ตำแหน่ง', expert.position],
+        ['สถานที่ทำงาน / สังกัด', expert.workplace],
+        ['ประสบการณ์การทำงาน', expert.experience],
+        ['ความเชี่ยวชาญ', expert.expertise],
+        ['อีเมล', expert.email],
+        ['เบอร์โทรศัพท์', expert.phone],
+      ].map(([k, v]) => `<div class="pf-item"><span>${k}</span><b>${v ? esc(v) : '<i class="muted" style="font-weight:400">ยังไม่ได้ระบุ</i>'}</b></div>`).join('')}
+    </div>
+    <p class="small muted" style="margin:10px 0 0">ข้อมูลนี้จะแสดงในตอนที่ 1 ของแบบประเมินที่ยังไม่ได้ลงนาม · อีเมลหรือเบอร์โทรศัพท์ใช้เป็นชื่อผู้ใช้ในการเข้าสู่ระบบ</p>
   </div>
   <h2>แบบประเมินที่ได้รับมอบหมาย (${assignments.length})</h2>
   ${assignments.length ? `<div class="grid cols-2">${assignments
@@ -213,6 +312,7 @@ function showExpertHome({ expert, assignments }) {
     await api('POST', '/api/expert/logout');
     location.href = '/';
   });
+  $('#editProfile').addEventListener('click', () => editMyProfile(expert, experienceOptions));
   $('#chpw').addEventListener('click', () =>
     modal(
       `<h2>เปลี่ยนรหัสผ่าน</h2>
@@ -273,12 +373,29 @@ async function apiForce(method, url, body) {
 
 // ======================= instruments list =======================
 async function viewInstruments() {
-  const list = await api('GET', '/api/admin/instruments');
+  const [list, experts] = await Promise.all([api('GET', '/api/admin/instruments'), api('GET', '/api/admin/experts')]);
+  const assigned = list.reduce((a, i) => a + i.assigned, 0);
+  const submitted = list.reduce((a, i) => a + i.submitted, 0);
+  const pctAll = assigned ? Math.round((submitted / assigned) * 100) : 0;
+  const withAcc = experts.filter((e) => e.hasLogin).length;
+  const hr = new Date().getHours();
+  const greet = hr < 12 ? 'สวัสดีตอนเช้า' : hr < 17 ? 'สวัสดีตอนบ่าย' : 'สวัสดีตอนเย็น';
   view.innerHTML = `
-  <div class="row between" style="margin-bottom:14px">
-    <h1 style="margin:0">แบบประเมินเครื่องมือวิจัย</h1>
-    <button class="primary" id="newInst">+ สร้างแบบประเมินใหม่</button>
+  <div class="hello">
+    <div class="row between">
+      <div class="row" style="gap:16px;flex-wrap:nowrap"><div class="av-wrap hello-av">${AVATAR_SVG}</div>
+        <div><span class="hello-chip">Smart Campus · IoB · AI Avatar</span><h1>${greet} 👋</h1><p>ภาพรวมการประเมินเครื่องมือวิจัย สู่วิทยาลัยอัจฉริยะและองค์กรแห่งความสุข 💜</p></div></div>
+      <div class="row"><a class="btn" href="#/experts">👥 จัดการผู้เชี่ยวชาญ</a><button class="primary" id="newInst" style="background:#fff;color:var(--primary)">✦ สร้างแบบประเมินใหม่</button></div>
+    </div>
   </div>
+  <div class="grid cols-4" style="margin-bottom:16px">
+    <div class="card stat"><div class="k"><i>🧪</i>เครื่องมือที่เปิดรับ</div><div class="v">${list.filter((i) => i.active).length}<small> / ${list.length} ชุด</small></div></div>
+    <div class="card stat"><div class="k"><i>👥</i>ผู้เชี่ยวชาญ</div><div class="v">${experts.length}<small> คน · มีบัญชี ${withAcc}</small></div></div>
+    <div class="card stat"><div class="k"><i>✍️</i>ลงนามส่งแล้ว</div><div class="v">${submitted}<small> / ${assigned} ฉบับ</small></div></div>
+    <div class="card stat"><div class="k"><i>📈</i>ความคืบหน้ารวม</div><div class="v">${pctAll}<small>%</small></div>
+      <div class="progress" style="margin-top:8px"><span style="width:${pctAll}%"></span></div></div>
+  </div>
+  <h2 style="margin:6px 0 12px">ชุดเครื่องมือวิจัย</h2>
   <div class="grid cols-2">
   ${list
     .map((i) => {
@@ -287,7 +404,8 @@ async function viewInstruments() {
       return `<a class="card" href="#/instrument/${i.id}" style="text-decoration:none;color:inherit;display:block">
         <div class="row between"><span class="badge info">${esc(i.code ? 'ชุดที่ ' + Number(i.code) : 'ไม่ระบุชุด')}${i.phase ? ' · ' + esc(i.phase) : ''}</span>
           ${i.active ? '' : '<span class="badge bad">ปิดรับ</span>'}${i.kind === 'survey' ? '<span class="badge">แบบสอบถามผู้ใช้</span>' : ''}</div>
-        <h3 style="margin:8px 0 4px">${esc(i.title)}</h3>
+        <div class="inst-head"><span class="inst-ic">${(INST_ICON[i.code] || ['📋'])[0]}</span>
+          <div><div class="small muted">${esc((INST_ICON[i.code] || [, ''])[1])}</div><h3 style="margin:0">${esc(i.title)}</h3></div></div>
         <div class="small muted" style="margin-bottom:10px">${esc(i.subtitle)}</div>
         <div class="small">${i.itemCount} ข้อ · ${scales}</div>
         <div class="row" style="margin-top:8px"><div class="progress" style="flex:1"><span style="width:${pct}%"></span></div>
@@ -1064,6 +1182,7 @@ const ACTIONS = {
   'instrument.attachment.remove': 'ลบไฟล์ประกอบ', 'expert.create': 'เพิ่มผู้เชี่ยวชาญ', 'expert.update': 'แก้ไขผู้เชี่ยวชาญ',
   'expert.delete': 'ลบผู้เชี่ยวชาญ', 'assignment.create': 'มอบหมายผู้ประเมิน', 'assignment.delete': 'ลบผู้ประเมินออกจากแบบประเมิน',
   'expert.password.view': 'ผู้ดูแลเรียกดูรหัสผู้เชี่ยวชาญ', 'expert.password.export': 'ดาวน์โหลดรหัสเข้าระบบ (Excel)',
+  'expert.profile': 'ผู้เชี่ยวชาญแก้ไขข้อมูลส่วนตัว', 'expert.account.setup': 'ผู้เชี่ยวชาญตั้งค่าบัญชี',
   'expert.import': 'นำเข้ารายชื่อจาก Excel', 'expert.sets': 'กำหนดชุดเครื่องมือของผู้เชี่ยวชาญ',
   'expert.login': 'ผู้เชี่ยวชาญเข้าสู่ระบบ', 'expert.password': 'ผู้เชี่ยวชาญเปลี่ยนรหัสผ่าน',
   'expert.password.reset': 'ตั้ง/รีเซ็ตรหัสผู้เชี่ยวชาญ', 'expert.password.revoke': 'ยกเลิกบัญชีผู้เชี่ยวชาญ',

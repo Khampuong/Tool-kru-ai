@@ -49,8 +49,7 @@ function renderGate() {
   const setup = !acc.hasPassword;
   document.title = 'การประเมินเครื่องมือ - ' + (setup ? 'ตั้งค่าบัญชี' : 'เข้าสู่ระบบ');
   $('#bar').classList.add('hidden');
-  const who = `<div class="who"><div class="av">${esc(initials(acc.name))}</div>
-    <div><div class="nm">${esc(acc.name)}</div><div class="small muted">ผู้เชี่ยวชาญที่ได้รับเชิญ</div></div></div>`;
+  const who = avatarGreet(`สวัสดี 🙏 ${esc(acc.name)}<span>ท่านได้รับเชิญเป็นผู้เชี่ยวชาญประเมินเครื่องมือวิจัย ขอบคุณที่ร่วมสร้างองค์กรแห่งความสุข 💜</span>`);
   const panel = setup
     ? `${who}
       <h2>ตั้งค่าบัญชีก่อนเริ่มประเมิน</h2>

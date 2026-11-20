@@ -156,7 +156,7 @@ function authHero(info, { chip = 'ระบบประเมินเครื�
     info.coAdvisor && `<div><b>อาจารย์ที่ปรึกษาร่วม</b> ${esc(info.coAdvisor)}</div>`,
   ].filter(Boolean).join('');
   return `<section class="auth-hero">
-    <span class="auth-chip">${ICON.doc} ${esc(chip)}</span>
+    <span class="auth-chip"><span class="live-dot"></span> Smart Campus · Internet of Behaviors</span>
     <h1>${esc(heading)}</h1>
     ${info.thesisTitle ? `<p class="thesis">${esc(info.thesisTitle)}</p>` : ''}
     ${extra}
@@ -169,6 +169,48 @@ function authHero(info, { chip = 'ระบบประเมินเครื�
     <div class="auth-foot">ข้อมูลของท่านใช้เพื่อการวิจัยเท่านั้น และได้รับการคุ้มครองตาม พ.ร.บ.คุ้มครองข้อมูลส่วนบุคคล พ.ศ. 2562</div>
   </section>`;
 }
+/** แผนภาพการไหลของข้อมูลตามกรอบงานวิจัย: IoT → IoB → AI Avatar → องค์กรแห่งความสุข */
+const IOB_ICON = {
+  sense: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2.2"/><path d="M8.2 8.2a5.4 5.4 0 0 0 0 7.6M15.8 8.2a5.4 5.4 0 0 1 0 7.6M5.3 5.3a9.5 9.5 0 0 0 0 13.4M18.7 5.3a9.5 9.5 0 0 1 0 13.4"/></svg>',
+  behav: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><circle cx="12" cy="10" r="2.4"/><path d="M6.7 7.1 10 9M17.3 7.1 14 9M12 12.4V16"/></svg>',
+  avatar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1h-7l-4 3v-3H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1z"/><circle cx="9" cy="10.5" r=".9" fill="currentColor"/><circle cx="15" cy="10.5" r=".9" fill="currentColor"/><path d="M9.5 13.3c1.4 1 3.6 1 5 0"/></svg>',
+  happy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 4l9 6.5"/><path d="M5 9.5V20h14V9.5"/><path d="M12 17.5s-3.2-1.9-3.2-4a1.7 1.7 0 0 1 3.2-.8 1.7 1.7 0 0 1 3.2.8c0 2.1-3.2 4-3.2 4z"/></svg>',
+};
+function iobFlow() {
+  const nodes = [
+    ['sense', 'IoT Sensing', 'กล้อง · เซนเซอร์'],
+    ['behav', 'IoB Analytics', 'วิเคราะห์พฤติกรรม'],
+    ['avatar', 'AI Avatar', 'อวตารโอภาปราศรัย'],
+    ['happy', 'Happy Org', 'องค์กรแห่งความสุข'],
+  ];
+  return `<div class="iob-flow" aria-label="กรอบแนวคิด: IoT → IoB → AI Avatar → องค์กรแห่งความสุข">${nodes
+    .map(([k, en, th], i) => `${i ? '<span class="iob-link" aria-hidden="true"><i></i></span>' : ''}<div class="iob-node"><span class="ic">${IOB_ICON[k]}</span><b>${en}</b><small>${th}</small></div>`)
+    .join('')}</div>`;
+}
+
+/** อวตารโอภาปราศรัย — ตัวละคร AI ที่ทักทายผู้ใช้อย่างเป็นมิตร (สื่อถึงองค์กรแห่งความสุข) */
+const AVATAR_SVG = `<svg class="avatar-svg" viewBox="0 0 120 120" aria-hidden="true">
+  <defs>
+    <linearGradient id="avg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8b5cff"/><stop offset="1" stop-color="#00b4ff"/></linearGradient>
+    <linearGradient id="avf" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#eef0ff"/></linearGradient>
+  </defs>
+  <circle cx="60" cy="64" r="50" fill="url(#avg)" opacity=".18"/>
+  <line x1="60" y1="14" x2="60" y2="26" stroke="url(#avg)" stroke-width="4" stroke-linecap="round"/>
+  <circle class="av-ping" cx="60" cy="11" r="6" fill="#ff4fd8"/>
+  <rect x="22" y="26" width="76" height="66" rx="30" fill="url(#avg)"/>
+  <rect x="30" y="36" width="60" height="44" rx="20" fill="url(#avf)"/>
+  <g class="av-eyes" fill="#2a1f66"><ellipse cx="47" cy="55" rx="5" ry="6"/><ellipse cx="73" cy="55" rx="5" ry="6"/></g>
+  <circle cx="39" cy="66" r="4.5" fill="#ff8ad8" opacity=".55"/><circle cx="81" cy="66" r="4.5" fill="#ff8ad8" opacity=".55"/>
+  <path d="M50 67c5 5 15 5 20 0" fill="none" stroke="#2a1f66" stroke-width="3.2" stroke-linecap="round"/>
+  <rect x="14" y="50" width="10" height="20" rx="5" fill="#00b4ff"/><rect x="96" y="50" width="10" height="20" rx="5" fill="#00b4ff"/>
+  <path class="av-heart" d="M92 98c-6-4-10-7.5-10-11.5a4.6 4.6 0 0 1 10-2 4.6 4.6 0 0 1 10 2c0 4-4 7.5-10 11.5z" fill="#ff4fd8"/>
+</svg>`;
+/** อวตารพร้อมกล่องข้อความทักทาย */
+function avatarGreet(text, { size = 64, dark = false } = {}) {
+  return `<div class="av-greet ${dark ? 'dark' : ''}"><div class="av-wrap" style="width:${size}px;height:${size}px">${AVATAR_SVG}</div>
+    <div class="av-bubble">${text}</div></div>`;
+}
+
 function authLayout(root, heroHtml, panelHtml) {
   document.body.classList.add('auth');
   root.innerHTML = `<div class="auth-wrap">${heroHtml}<section class="auth-panel"><div class="auth-card">${panelHtml}</div></section></div>`;
