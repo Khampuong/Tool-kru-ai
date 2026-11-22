@@ -1,0 +1,15 @@
+# ข้อมูลจริง/ข้อมูลส่วนบุคคล — ห้ามอัปโหลดขึ้น Vercel
+data
+Tool-research
+.env*
+# ไม่ใช้บน Vercel
+node_modules
+test
+cloud
+worker
+scripts
+.wrangler
+Dockerfile
+.dockerignore
+wrangler.jsonc
+*.log

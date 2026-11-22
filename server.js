@@ -7,9 +7,32 @@ const store = require('./lib/db');
 const { computeResults, round2 } = require('./lib/stats');
 const exporter = require('./lib/export');
 
+// Express 4 ไม่ส่ง error จาก handler แบบ async ไปยังตัวจัดการ error — แก้ที่ Layer ให้รองรับ Promise
+{
+  const Layer = require('express/lib/router/layer');
+  Layer.prototype.handle_request = function handle(req, res, next) {
+    const fn = this.handle;
+    if (fn.length > 3) return next();
+    try {
+      const r = fn(req, res, next);
+      if (r && typeof r.then === 'function') r.catch(next);
+    } catch (e) {
+      next(e);
+    }
+  };
+}
+
 const PORT = Number(process.env.PORT) || 3000;
-store.open();
 const { db, httpError } = store;
+/** sessionSecret ไม่เปลี่ยนหลังสร้าง จึงอ่านครั้งเดียวตอนเริ่มระบบ */
+let SESSION_SECRET = null;
+/** เริ่มระบบ (สร้างตาราง/seed/รหัสผู้ดูแล) — ทุกคำขอรอให้เสร็จก่อน */
+const ready = (async () => {
+  await store.open();
+  await initPassword();
+  SESSION_SECRET = (await store.getSettings({ includeSecret: true })).sessionSecret;
+})();
+ready.catch((e) => console.error('[init] failed:', e));
 
 // ======================= ADMIN AUTH =======================
 function hashPassword(pw) {
@@ -23,16 +46,20 @@ function checkPassword(pw, stored) {
   const exp = Buffer.from(h, 'hex');
   return got.length === exp.length && crypto.timingSafeEqual(got, exp);
 }
-(function initPassword() {
-  const s = store.getSettings({ includeSecret: true });
+async function initPassword() {
+  const s = await store.getSettings({ includeSecret: true });
   if (process.env.ADMIN_PASSWORD) return;
   if (!s.adminPasswordHash) {
     const pw = crypto.randomBytes(6).toString('base64url');
-    store.setSettings({ adminPasswordHash: hashPassword(pw) });
-    fs.writeFileSync(path.join(store.DATA_DIR, 'ADMIN_PASSWORD.txt'), pw + '\n');
+    await store.setSettings({ adminPasswordHash: hashPassword(pw) });
+    try {
+      fs.writeFileSync(path.join(store.DATA_DIR, 'ADMIN_PASSWORD.txt'), pw + '\n');
+    } catch {
+      /* ระบบไฟล์อ่านอย่างเดียว (เช่น Vercel) — ดูรหัสจาก log */
+    }
     console.log(`\n[ระบบ] สร้างรหัสผ่านผู้ดูแลครั้งแรก: ${pw}\n       (บันทึกไว้ที่ data/ADMIN_PASSWORD.txt — เปลี่ยนได้ในหน้าตั้งค่า)\n`);
   }
-})();
+}
 
 // ---------- เก็บรหัสผ่านผู้เชี่ยวชาญแบบเข้ารหัส (ผู้ดูแลเรียกดูได้) ----------
 function pwKey() {
@@ -57,7 +84,8 @@ function decryptPw(enc) {
 
 const SESSION_HOURS = 12;
 function secret() {
-  return store.getSettings({ includeSecret: true }).sessionSecret;
+  if (!SESSION_SECRET) throw new Error('session secret not loaded');
+  return SESSION_SECRET;
 }
 function sign(v) {
   return crypto.createHmac('sha256', secret()).update(v).digest('base64url');
@@ -94,7 +122,7 @@ function makeExpertSession(id, hash) {
   const v = `e.${id}.${Date.now() + SESSION_HOURS * 3600e3}.${pwVer(hash)}`;
   return `${v}.${sign(v)}`;
 }
-function expertSession(req) {
+async function expertSession(req) {
   const c = parseCookies(req).exs;
   if (!c) return null;
   const i = c.lastIndexOf('.');
@@ -104,7 +132,7 @@ function expertSession(req) {
   if (sig.length !== exp.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(exp))) return null;
   const [, id, until, ver] = v.split('.');
   if (Number(until) < Date.now()) return null;
-  const e = db.prepare('SELECT * FROM experts WHERE id=?').get(Number(id));
+  const e = await db.prepare('SELECT * FROM experts WHERE id=?').get(Number(id));
   if (!e || !e.password_hash || pwVer(e.password_hash) !== ver) return null;
   return e;
 }
@@ -127,7 +155,16 @@ app.use((req, res, next) => {
   next();
 });
 app.use('/static', express.static(path.join(__dirname, 'public'), { maxAge: 0 }));
-app.use('/uploads', express.static(store.UPLOAD_DIR, { maxAge: '1h' }));
+// รอให้ฐานข้อมูลพร้อมก่อนตอบคำขอแบบไดนามิก
+app.use((req, res, next) => ready.then(() => next(), next));
+/** ไฟล์แนบเก็บในฐานข้อมูล (ตาราง files) */
+app.get('/uploads/:name', async (req, res) => {
+  const f = await store.getFile(path.basename(String(req.params.name)));
+  if (!f) return res.status(404).end();
+  res.setHeader('Content-Type', f.mime);
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.send(f.data);
+});
 app.get(['/', '/login'], (req, res) => res.sendFile(path.join(__dirname, 'public', 'admin.html')));
 app.get('/favicon.ico', (req, res) => res.status(204).end());
 app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'public', 'admin.html')));
@@ -135,7 +172,7 @@ app.get('/e/:token', (req, res) => res.sendFile(path.join(__dirname, 'public', '
 
 // ---------- login ----------
 const loginAttempts = new Map();
-app.post('/api/admin/login', (req, res) => {
+app.post('/api/admin/login', async (req, res) => {
   const key = req.ip;
   const a = loginAttempts.get(key) || { n: 0, t: Date.now() };
   if (Date.now() - a.t > 15 * 60e3) Object.assign(a, { n: 0, t: Date.now() });
@@ -144,7 +181,7 @@ app.post('/api/admin/login', (req, res) => {
   const ok = process.env.ADMIN_PASSWORD
     ? pw.length === process.env.ADMIN_PASSWORD.length &&
       crypto.timingSafeEqual(Buffer.from(pw), Buffer.from(process.env.ADMIN_PASSWORD))
-    : checkPassword(pw, store.getSettings({ includeSecret: true }).adminPasswordHash);
+    : checkPassword(pw, (await store.getSettings({ includeSecret: true })).adminPasswordHash);
   if (!ok) {
     a.n++;
     loginAttempts.set(key, a);
@@ -153,7 +190,7 @@ app.post('/api/admin/login', (req, res) => {
   loginAttempts.delete(key);
   const secure = req.secure ? '; Secure' : '';
   res.setHeader('Set-Cookie', `adm=${encodeURIComponent(makeSession())}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_HOURS * 3600}${secure}`);
-  store.audit('admin', 'login', { ip: req.ip });
+  await store.audit('admin', 'login', { ip: req.ip });
   res.json({ ok: true });
 });
 app.post('/api/admin/logout', (req, res) => {
@@ -172,7 +209,7 @@ function throttle(req, res) {
   }
   return { fail: () => { a.n++; loginAttempts.set(key, a); }, ok: () => loginAttempts.delete(key) };
 }
-app.post('/api/expert/login', (req, res) => {
+app.post('/api/expert/login', async (req, res) => {
   const t = throttle(req, res);
   if (!t) return;
   // เข้าสู่ระบบด้วยอีเมล หรือ เบอร์โทรศัพท์ 10 หลัก
@@ -180,39 +217,39 @@ app.post('/api/expert/login', (req, res) => {
   const pw = String(req.body?.password || '');
   const digits = login.replace(/[\s-]/g, '');
   let cands = [];
-  if (/^\d{10}$/.test(digits)) cands = db.prepare('SELECT * FROM experts WHERE phone=? AND password_hash IS NOT NULL').all(digits);
-  else if (login) cands = db.prepare('SELECT * FROM experts WHERE lower(trim(email))=? AND password_hash IS NOT NULL').all(login.toLowerCase());
+  if (/^\d{10}$/.test(digits)) cands = await db.prepare('SELECT * FROM experts WHERE phone=? AND password_hash IS NOT NULL').all(digits);
+  else if (login) cands = await db.prepare('SELECT * FROM experts WHERE lower(trim(email))=? AND password_hash IS NOT NULL').all(login.toLowerCase());
   const e = cands.find((x) => checkPassword(pw, x.password_hash));
   if (!e) {
     t.fail();
     return res.status(401).json({ error: 'อีเมล/เบอร์โทรศัพท์ หรือรหัสผ่านไม่ถูกต้อง' });
   }
   t.ok();
-  db.prepare('UPDATE experts SET last_login=CURRENT_TIMESTAMP WHERE id=?').run(e.id);
+  await db.prepare('UPDATE experts SET last_login=CURRENT_TIMESTAMP WHERE id=?').run(e.id);
   const secure = req.secure ? '; Secure' : '';
   res.setHeader('Set-Cookie', `exs=${encodeURIComponent(makeExpertSession(e.id, e.password_hash))}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_HOURS * 3600}${secure}`);
-  store.audit('expert', 'expert.login', { id: e.id, name: e.name, ip: req.ip });
+  await store.audit('expert', 'expert.login', { id: e.id, name: e.name, ip: req.ip });
   res.json({ ok: true });
 });
 app.post('/api/expert/logout', (req, res) => {
   res.setHeader('Set-Cookie', 'exs=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
   res.json({ ok: true });
 });
-app.get('/api/expert/me', (req, res) => {
-  const e = expertSession(req);
+app.get('/api/expert/me', async (req, res) => {
+  const e = await expertSession(req);
   if (!e) return res.json({ expert: null });
   res.json({
     expert: {
       id: e.id, name: e.name, position: e.position, workplace: e.workplace, experience: e.experience,
       expertise: e.expertise, email: e.email, phone: e.phone,
     },
-    experienceOptions: store.getSettings().experienceOptions || [],
-    assignments: store.expertAssignments(e.id),
+    experienceOptions: (await store.getSettings()).experienceOptions || [],
+    assignments: await store.expertAssignments(e.id),
   });
 });
 /** ผู้เชี่ยวชาญแก้ไขข้อมูลส่วนตัวของตนเอง */
-app.put('/api/expert/profile', (req, res) => {
-  const e = expertSession(req);
+app.put('/api/expert/profile', async (req, res) => {
+  const e = await expertSession(req);
   if (!e) throw httpError(401, 'กรุณาเข้าสู่ระบบ');
   const b = req.body || {};
   const v = {
@@ -227,39 +264,40 @@ app.put('/api/expert/profile', (req, res) => {
   if (!v.name) throw httpError(400, 'กรุณากรอกชื่อ-นามสกุล');
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(v.email)) throw httpError(400, 'กรุณากรอกอีเมลให้ถูกต้อง');
   if (!/^\d{10}$/.test(v.phone)) throw httpError(400, 'เบอร์โทรศัพท์ต้องเป็นตัวเลข 10 หลัก');
-  const clash = db
+  const clash = await db
     .prepare('SELECT id FROM experts WHERE id<>? AND password_hash IS NOT NULL AND (lower(trim(email))=? OR phone=?)')
     .get(e.id, v.email.toLowerCase(), v.phone);
   if (clash) throw httpError(409, 'อีเมลหรือเบอร์โทรศัพท์นี้ถูกใช้กับบัญชีอื่นแล้ว');
   const before = { name: e.name, position: e.position, workplace: e.workplace, experience: e.experience, expertise: e.expertise, email: e.email, phone: e.phone };
-  store.tx(() => {
-    db.prepare('UPDATE experts SET name=?, position=?, workplace=?, experience=?, expertise=?, email=?, phone=? WHERE id=?')
+  await store.tx(async () => {
+    await db.prepare('UPDATE experts SET name=?, position=?, workplace=?, experience=?, expertise=?, email=?, phone=? WHERE id=?')
       .run(v.name, v.position, v.workplace, v.experience, v.expertise, v.email, v.phone, e.id);
     // ปรับตอนที่ 1 ของแบบประเมินที่ยังไม่ลงนาม (ฉบับที่ลงนามแล้วคงข้อมูลเดิมไว้)
     const prof = JSON.stringify({ name: v.name, position: v.position, workplace: v.workplace, experience: v.experience });
-    db.prepare("UPDATE assignments SET profile=? WHERE expert_id=? AND status<>'submitted'").run(prof, e.id);
+    await db.prepare("UPDATE assignments SET profile=? WHERE expert_id=? AND status<>'submitted'").run(prof, e.id);
   });
-  store.audit('expert', 'expert.profile', { id: e.id, before, after: v });
+  await store.audit('expert', 'expert.profile', { id: e.id, before, after: v });
   res.json({ ok: true });
 });
-app.post('/api/expert/password', (req, res) => {
-  const e = expertSession(req);
+app.post('/api/expert/password', async (req, res) => {
+  const e = await expertSession(req);
   if (!e) throw httpError(401, 'กรุณาเข้าสู่ระบบ');
   const { current, next } = req.body || {};
   if (!checkPassword(String(current || ''), e.password_hash)) throw httpError(400, 'รหัสผ่านปัจจุบันไม่ถูกต้อง');
   if (String(next || '').length < 8) throw httpError(400, 'รหัสผ่านใหม่ต้องยาวอย่างน้อย 8 ตัวอักษร');
   const h = hashPassword(String(next));
   // รหัสที่ผู้เชี่ยวชาญตั้งเองเป็นความลับของผู้เชี่ยวชาญ จึงลบสำเนาที่ผู้ดูแลเก็บไว้
-  db.prepare('UPDATE experts SET password_hash=?, password_enc=NULL WHERE id=?').run(h, e.id);
-  res.setHeader('Set-Cookie', `exs=${encodeURIComponent(makeExpertSession(e.id, h))}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_HOURS * 3600}`);
-  store.audit('expert', 'expert.password', { id: e.id });
+  await db.prepare('UPDATE experts SET password_hash=?, password_enc=NULL WHERE id=?').run(h, e.id);
+  const secure = req.secure ? '; Secure' : '';
+  res.setHeader('Set-Cookie', `exs=${encodeURIComponent(makeExpertSession(e.id, h))}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_HOURS * 3600}${secure}`);
+  await store.audit('expert', 'expert.password', { id: e.id });
   res.json({ ok: true });
 });
 
 /** ข้อมูลสาธารณะสำหรับหน้าเข้าสู่ระบบ */
-app.get('/api/public/info', (req, res) => {
-  const s = store.getSettings();
-  const n = db.prepare("SELECT COUNT(*) c FROM instruments WHERE active=1").get().c;
+app.get('/api/public/info', async (req, res) => {
+  const s = await store.getSettings();
+  const n = (await db.prepare("SELECT COUNT(*) c FROM instruments WHERE active=1").get()).c;
   res.json({ thesisTitle: s.thesisTitle || '', researcher: s.researcher || '', advisor: s.advisor || '', coAdvisor: s.coAdvisor || '', instrumentCount: n });
 });
 
@@ -271,8 +309,8 @@ const SETTING_KEYS = [
   'thesisTitle', 'researcher', 'advisor', 'coAdvisor', 'contact', 'thanks',
   'iocCriterion', 'ratingCriterion', 'sdMax', 'aggMethod', 'levels', 'experienceOptions',
 ];
-A.get('/settings', (req, res) => res.json({ ...store.getSettings(), envPassword: !!process.env.ADMIN_PASSWORD }));
-A.put('/settings', (req, res) => {
+A.get('/settings', async (req, res) => res.json({ ...(await store.getSettings()), envPassword: !!process.env.ADMIN_PASSWORD }));
+A.put('/settings', async (req, res) => {
   const b = req.body || {};
   const out = {};
   for (const k of SETTING_KEYS) if (k in b) out[k] = b[k];
@@ -286,93 +324,97 @@ A.put('/settings', (req, res) => {
   }
   if ('aggMethod' in out && !['respondent', 'pooled'].includes(out.aggMethod)) throw httpError(400, 'วิธีคำนวณไม่ถูกต้อง');
   if ('experienceOptions' in out) out.experienceOptions = (out.experienceOptions || []).map(String).filter(Boolean);
-  store.setSettings(out);
-  store.audit('admin', 'settings.update', out);
-  res.json(store.getSettings());
+  await store.setSettings(out);
+  await store.audit('admin', 'settings.update', out);
+  res.json(await store.getSettings());
 });
-A.post('/password', (req, res) => {
+A.post('/password', async (req, res) => {
   if (process.env.ADMIN_PASSWORD) throw httpError(400, 'รหัสผ่านถูกกำหนดผ่านตัวแปร ADMIN_PASSWORD จึงเปลี่ยนในหน้านี้ไม่ได้');
   const { current, next } = req.body || {};
-  if (!checkPassword(current, store.getSettings({ includeSecret: true }).adminPasswordHash))
+  if (!checkPassword(current, (await store.getSettings({ includeSecret: true })).adminPasswordHash))
     throw httpError(400, 'รหัสผ่านปัจจุบันไม่ถูกต้อง');
   if (String(next || '').length < 8) throw httpError(400, 'รหัสผ่านใหม่ต้องยาวอย่างน้อย 8 ตัวอักษร');
-  store.setSettings({ adminPasswordHash: hashPassword(String(next)) });
-  const f = path.join(store.DATA_DIR, 'ADMIN_PASSWORD.txt');
-  if (fs.existsSync(f)) fs.unlinkSync(f);
-  store.audit('admin', 'password.change', null);
+  await store.setSettings({ adminPasswordHash: hashPassword(String(next)) });
+  try {
+    const f = path.join(store.DATA_DIR, 'ADMIN_PASSWORD.txt');
+    if (fs.existsSync(f)) fs.unlinkSync(f);
+  } catch {
+    /* ระบบไฟล์อ่านอย่างเดียว */
+  }
+  await store.audit('admin', 'password.change', null);
   res.json({ ok: true });
 });
 
 // ---------- instruments ----------
-A.get('/instruments', (req, res) => res.json(store.listInstruments()));
-A.post('/instruments', (req, res) => {
-  const id = store.createInstrument(req.body || {});
-  store.audit('admin', 'instrument.create', { id });
+A.get('/instruments', async (req, res) => res.json(await store.listInstruments()));
+A.post('/instruments', async (req, res) => {
+  const id = await store.createInstrument(req.body || {});
+  await store.audit('admin', 'instrument.create', { id });
   res.json({ id });
 });
-A.get('/instruments/:id', (req, res) => {
-  const inst = store.getInstrument(Number(req.params.id));
+A.get('/instruments/:id', async (req, res) => {
+  const inst = await store.getInstrument(Number(req.params.id));
   if (!inst) throw httpError(404, 'ไม่พบแบบประเมิน');
   res.json(inst);
 });
-A.put('/instruments/:id', (req, res) => {
+A.put('/instruments/:id', async (req, res) => {
   const id = Number(req.params.id);
-  if (!store.getInstrument(id)) throw httpError(404, 'ไม่พบแบบประเมิน');
-  store.updateInstrumentMeta(id, req.body || {});
-  store.audit('admin', 'instrument.update', { id, ...req.body });
-  res.json(store.getInstrument(id));
+  if (!(await store.getInstrument(id))) throw httpError(404, 'ไม่พบแบบประเมิน');
+  await store.updateInstrumentMeta(id, req.body || {});
+  await store.audit('admin', 'instrument.update', { id, ...req.body });
+  res.json(await store.getInstrument(id));
 });
-A.put('/instruments/:id/structure', (req, res) => {
+A.put('/instruments/:id/structure', async (req, res) => {
   const id = Number(req.params.id);
-  const before = store.getInstrument(id);
-  const r = store.saveStructure(id, req.body?.sections || [], { force: !!req.body?.force });
-  store.audit('admin', 'instrument.structure', { id, removedItems: r.removedItems, before: before?.sections });
-  res.json(store.getInstrument(id));
+  const before = await store.getInstrument(id);
+  const r = await store.saveStructure(id, req.body?.sections || [], { force: !!req.body?.force });
+  await store.audit('admin', 'instrument.structure', { id, removedItems: r.removedItems, before: before?.sections });
+  res.json(await store.getInstrument(id));
 });
-A.post('/instruments/:id/duplicate', (req, res) => {
-  const nid = store.duplicateInstrument(Number(req.params.id));
+A.post('/instruments/:id/duplicate', async (req, res) => {
+  const nid = await store.duplicateInstrument(Number(req.params.id));
   if (!nid) throw httpError(404, 'ไม่พบแบบประเมิน');
-  store.audit('admin', 'instrument.duplicate', { from: Number(req.params.id), id: nid });
+  await store.audit('admin', 'instrument.duplicate', { from: Number(req.params.id), id: nid });
   res.json({ id: nid });
 });
-A.delete('/instruments/:id', (req, res) => {
+A.delete('/instruments/:id', async (req, res) => {
   const id = Number(req.params.id);
-  const n = db.prepare("SELECT COUNT(*) c FROM assignments WHERE instrument_id=? AND status='submitted'").get(id).c;
+  const n = (await db.prepare("SELECT COUNT(*) c FROM assignments WHERE instrument_id=? AND status='submitted'").get(id)).c;
   if (n && req.query.force !== '1') throw Object.assign(httpError(409, `มีผู้ประเมินส่งแบบประเมินนี้แล้ว ${n} คน`), { needForce: true });
-  const inst = store.getInstrument(id);
-  db.prepare('DELETE FROM instruments WHERE id=?').run(id);
-  store.audit('admin', 'instrument.delete', { id, title: inst?.title });
+  const inst = await store.getInstrument(id);
+  await store.deleteInstrument(id);
+  await store.audit('admin', 'instrument.delete', { id, title: inst?.title });
   res.json({ ok: true });
 });
 const ALLOWED_UPLOAD = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp', 'application/pdf': '.pdf' };
-A.post('/instruments/:id/attachment', (req, res) => {
+A.post('/instruments/:id/attachment', async (req, res) => {
   const id = Number(req.params.id);
   const m = /^data:([\w/+.-]+);base64,(.+)$/.exec(String(req.body?.dataUrl || ''));
   if (!m || !ALLOWED_UPLOAD[m[1]]) throw httpError(400, 'รองรับเฉพาะไฟล์ PNG, JPG, WEBP หรือ PDF');
   const buf = Buffer.from(m[2], 'base64');
   if (buf.length > 10 * 1024 * 1024) throw httpError(400, 'ไฟล์ต้องมีขนาดไม่เกิน 10 MB');
   const name = `inst${id}_${crypto.randomBytes(6).toString('hex')}${ALLOWED_UPLOAD[m[1]]}`;
-  fs.writeFileSync(path.join(store.UPLOAD_DIR, name), buf);
-  db.prepare('UPDATE instruments SET attachment=?, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(name, id);
-  store.audit('admin', 'instrument.attachment', { id, name });
+  await store.putFile(name, buf, m[1]);
+  await db.prepare('UPDATE instruments SET attachment=?, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(name, id);
+  await store.audit('admin', 'instrument.attachment', { id, name });
   res.json({ attachment: name });
 });
-A.delete('/instruments/:id/attachment', (req, res) => {
-  db.prepare('UPDATE instruments SET attachment=NULL WHERE id=?').run(Number(req.params.id));
-  store.audit('admin', 'instrument.attachment.remove', { id: Number(req.params.id) });
+A.delete('/instruments/:id/attachment', async (req, res) => {
+  await db.prepare('UPDATE instruments SET attachment=NULL WHERE id=?').run(Number(req.params.id));
+  await store.audit('admin', 'instrument.attachment.remove', { id: Number(req.params.id) });
   res.json({ ok: true });
 });
 
 // ---------- experts ----------
-A.get('/experts', (req, res) => res.json(store.listExperts()));
-A.post('/experts', (req, res) => {
-  const id = store.saveExpert(null, req.body || {});
-  store.audit('admin', 'expert.create', { id, name: req.body?.name });
+A.get('/experts', async (req, res) => res.json(await store.listExperts()));
+A.post('/experts', async (req, res) => {
+  const id = await store.saveExpert(null, req.body || {});
+  await store.audit('admin', 'expert.create', { id, name: req.body?.name });
   res.json({ id });
 });
-A.put('/experts/:id', (req, res) => {
-  const id = store.saveExpert(Number(req.params.id), req.body || {});
-  store.audit('admin', 'expert.update', { id, ...req.body });
+A.put('/experts/:id', async (req, res) => {
+  const id = await store.saveExpert(Number(req.params.id), req.body || {});
+  await store.audit('admin', 'expert.update', { id, ...req.body });
   res.json({ id });
 });
 // ---------- import experts from Excel / CSV ----------
@@ -392,51 +434,53 @@ A.post('/experts/import', async (req, res, next) => {
     if (!m) throw httpError(400, 'กรุณาเลือกไฟล์ Excel (.xlsx) หรือ CSV');
     const buf = Buffer.from(m[1], 'base64');
     if (buf.length > 10 * 1024 * 1024) throw httpError(400, 'ไฟล์ต้องมีขนาดไม่เกิน 10 MB');
-    const existing = db.prepare('SELECT name FROM experts').all().map((r) => r.name);
+    const existing = (await db.prepare('SELECT name FROM experts').all()).map((r) => r.name);
     const parsed = await importer.parseExperts(buf, String(b.filename || ''), existing);
     if (!b.commit) return res.json(parsed);
     const toAdd = parsed.rows.filter((r) => r.status === 'new' || (!b.skipDuplicates && r.status !== 'new'));
     const sets = (b.instrumentIds || []).map(Number).filter(Boolean);
-    const ids = store.tx(() =>
-      toAdd.map((r) => {
-        const id = store.saveExpert(null, { ...r, phone: /^\d{10}$/.test(r.phone) ? r.phone : '' });
-        if (sets.length) store.setExpertSets(id, sets);
-        return id;
-      })
-    );
-    store.audit('admin', 'expert.import', { file: b.filename, added: ids.length, skipped: parsed.rows.length - ids.length, instrumentIds: sets });
+    const ids = await store.tx(async () => {
+      const out = [];
+      for (const r of toAdd) {
+        const id = await store.saveExpert(null, { ...r, phone: /^\d{10}$/.test(r.phone) ? r.phone : '' });
+        if (sets.length) await store.setExpertSets(id, sets);
+        out.push(id);
+      }
+      return out;
+    });
+    await store.audit('admin', 'expert.import', { file: b.filename, added: ids.length, skipped: parsed.rows.length - ids.length, instrumentIds: sets });
     res.json({ added: ids.length, skipped: parsed.rows.length - ids.length });
   } catch (e) {
     next(e);
   }
 });
-A.put('/experts/:id/sets', (req, res) => {
+A.put('/experts/:id/sets', async (req, res) => {
   const id = Number(req.params.id);
-  if (!db.prepare('SELECT 1 FROM experts WHERE id=?').get(id)) throw httpError(404, 'ไม่พบผู้เชี่ยวชาญ');
-  const r = store.setExpertSets(id, req.body?.instrumentIds || [], { force: !!req.body?.force });
-  store.audit('admin', 'expert.sets', { id, instrumentIds: req.body?.instrumentIds, ...r });
+  if (!(await db.prepare('SELECT 1 FROM experts WHERE id=?').get(id))) throw httpError(404, 'ไม่พบผู้เชี่ยวชาญ');
+  const r = await store.setExpertSets(id, req.body?.instrumentIds || [], { force: !!req.body?.force });
+  await store.audit('admin', 'expert.sets', { id, instrumentIds: req.body?.instrumentIds, ...r });
   res.json(r);
 });
 /** สร้าง/รีเซ็ตรหัสผ่านเข้าสู่ระบบของผู้เชี่ยวชาญ — คืนรหัสให้ผู้ดูแลแจ้งผู้เชี่ยวชาญ (แสดงครั้งเดียว) */
-A.post('/experts/:id/password', (req, res) => {
-  const e = db.prepare('SELECT * FROM experts WHERE id=?').get(Number(req.params.id));
+A.post('/experts/:id/password', async (req, res) => {
+  const e = await db.prepare('SELECT * FROM experts WHERE id=?').get(Number(req.params.id));
   if (!e) throw httpError(404, 'ไม่พบผู้เชี่ยวชาญ');
   if (!String(e.email || '').trim() && !/^\d{10}$/.test(e.phone || ''))
     throw httpError(400, 'กรุณาบันทึกอีเมลหรือเบอร์โทรศัพท์ 10 หลักของผู้เชี่ยวชาญก่อน (ใช้เป็นชื่อผู้ใช้ในการเข้าสู่ระบบ) — หรือส่งลิงก์ให้ผู้เชี่ยวชาญตั้งค่าบัญชีเอง');
   const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
   const pw = Array.from(crypto.randomBytes(10), (b) => alphabet[b % alphabet.length]).join('');
-  db.prepare('UPDATE experts SET password_hash=?, password_enc=? WHERE id=?').run(hashPassword(pw), encryptPw(pw), e.id);
-  store.audit('admin', 'expert.password.reset', { id: e.id, name: e.name });
+  await db.prepare('UPDATE experts SET password_hash=?, password_enc=? WHERE id=?').run(hashPassword(pw), encryptPw(pw), e.id);
+  await store.audit('admin', 'expert.password.reset', { id: e.id, name: e.name });
   res.json({ email: String(e.email || '').trim(), phone: e.phone || '', password: pw });
 });
 /** เรียกดูรหัสผ่านที่ผู้ดูแลสร้างไว้ */
-A.get('/experts/:id/password', (req, res) => {
-  const e = db.prepare('SELECT * FROM experts WHERE id=?').get(Number(req.params.id));
+A.get('/experts/:id/password', async (req, res) => {
+  const e = await db.prepare('SELECT * FROM experts WHERE id=?').get(Number(req.params.id));
   if (!e) throw httpError(404, 'ไม่พบผู้เชี่ยวชาญ');
   if (!e.password_hash) throw httpError(404, 'ผู้เชี่ยวชาญท่านนี้ยังไม่มีรหัสเข้าระบบ');
   const pw = e.password_enc ? decryptPw(e.password_enc) : null;
   if (!pw) throw httpError(404, 'ไม่มีรหัสที่เก็บไว้ (ผู้เชี่ยวชาญเปลี่ยนรหัสเอง หรือรหัสถูกตั้งก่อนมีระบบเก็บรหัส) — กด “รีเซ็ตรหัส” เพื่อสร้างรหัสใหม่');
-  store.audit('admin', 'expert.password.view', { id: e.id, name: e.name });
+  await store.audit('admin', 'expert.password.view', { id: e.id, name: e.name });
   res.json({ email: String(e.email || '').trim(), phone: e.phone || '', password: pw });
 });
 /** ส่งออกข้อมูลเข้าสู่ระบบของผู้เชี่ยวชาญทั้งหมดเป็น Excel */
@@ -451,88 +495,90 @@ A.get('/experts/credentials.xlsx', async (req, res, next) => {
     ];
     ws.getRow(1).font = { bold: true };
     const origin = `${req.protocol}://${req.get('host')}/`;
-    store.listExperts().forEach((x, i) => {
-      const raw = db.prepare('SELECT password_hash, password_enc FROM experts WHERE id=?').get(x.id);
+    const rawById = new Map((await db.prepare('SELECT id, password_hash, password_enc FROM experts').all()).map((r) => [r.id, r]));
+    (await store.listExperts()).forEach((x, i) => {
+      const raw = rawById.get(x.id) || {};
       const pw = raw.password_hash && raw.password_enc ? decryptPw(raw.password_enc) : null;
       const note = !raw.password_hash ? (x.email ? 'ยังไม่ได้ตั้งรหัส' : 'ไม่มีอีเมล — ใช้ลิงก์เฉพาะบุคคล') : pw ? `เข้าระบบที่ ${origin}` : 'ไม่มีรหัสที่เก็บไว้ (ผู้เชี่ยวชาญเปลี่ยนเอง หรือตั้งก่อนมีระบบเก็บรหัส) — กดรีเซ็ตรหัส';
       ws.addRow([i + 1, x.name, x.email, pw || '', x.phone, x.sets.map((s) => 'ชุด ' + (Number(s.code) || s.instrument_id)).join(', '), note]);
     });
     ws.getColumn(5).numFmt = '@';
-    store.audit('admin', 'expert.password.export', null);
+    await store.audit('admin', 'expert.password.export', null);
     sendFile(res, await wb.xlsx.writeBuffer(), 'รหัสเข้าระบบผู้เชี่ยวชาญ', 'xlsx');
   } catch (e) {
     next(e);
   }
 });
-A.delete('/experts/:id/password', (req, res) => {
-  db.prepare('UPDATE experts SET password_hash=NULL, password_enc=NULL WHERE id=?').run(Number(req.params.id));
-  store.audit('admin', 'expert.password.revoke', { id: Number(req.params.id) });
+A.delete('/experts/:id/password', async (req, res) => {
+  await db.prepare('UPDATE experts SET password_hash=NULL, password_enc=NULL WHERE id=?').run(Number(req.params.id));
+  await store.audit('admin', 'expert.password.revoke', { id: Number(req.params.id) });
   res.json({ ok: true });
 });
-A.delete('/experts/:id', (req, res) => {
+A.delete('/experts/:id', async (req, res) => {
   const id = Number(req.params.id);
-  const n = db.prepare("SELECT COUNT(*) c FROM assignments WHERE expert_id=? AND status='submitted'").get(id).c;
+  const n = (await db.prepare("SELECT COUNT(*) c FROM assignments WHERE expert_id=? AND status='submitted'").get(id)).c;
   if (n && req.query.force !== '1') throw Object.assign(httpError(409, `ผู้เชี่ยวชาญท่านนี้ส่งแบบประเมินแล้ว ${n} ฉบับ หากลบ ผลการประเมินจะถูกลบด้วย`), { needForce: true });
-  db.prepare('DELETE FROM experts WHERE id=?').run(id);
-  store.audit('admin', 'expert.delete', { id });
+  await store.deleteExpert(id);
+  await store.audit('admin', 'expert.delete', { id });
   res.json({ ok: true });
 });
 
 // ---------- assignments ----------
-A.get('/instruments/:id/assignments', (req, res) => res.json(store.listAssignments(Number(req.params.id))));
-A.post('/instruments/:id/assignments', (req, res) => {
+A.get('/instruments/:id/assignments', async (req, res) => res.json(await store.listAssignments(Number(req.params.id))));
+A.post('/instruments/:id/assignments', async (req, res) => {
   const ids = (req.body?.expertIds || []).map(Number).filter(Boolean);
-  const added = store.assign(Number(req.params.id), ids);
-  store.audit('admin', 'assignment.create', { instrumentId: Number(req.params.id), expertIds: ids });
+  const added = await store.assign(Number(req.params.id), ids);
+  await store.audit('admin', 'assignment.create', { instrumentId: Number(req.params.id), expertIds: ids });
   res.json({ added });
 });
-A.delete('/assignments/:id', (req, res) => {
-  const a = store.getAssignment(Number(req.params.id));
+A.delete('/assignments/:id', async (req, res) => {
+  const a = await store.getAssignment(Number(req.params.id));
   if (!a) throw httpError(404, 'ไม่พบรายการ');
   if (a.status === 'submitted' && req.query.force !== '1')
     throw Object.assign(httpError(409, 'ผู้เชี่ยวชาญส่งแบบประเมินนี้แล้ว หากลบ คำตอบและลายมือชื่อจะถูกลบด้วย'), { needForce: true });
-  db.prepare('DELETE FROM assignments WHERE id=?').run(a.id);
-  store.audit('admin', 'assignment.delete', { id: a.id, status: a.status });
+  await store.deleteAssignment(a.id);
+  await store.audit('admin', 'assignment.delete', { id: a.id, status: a.status });
   res.json({ ok: true });
 });
-A.post('/assignments/:id/reopen', (req, res) => {
-  const a = store.getAssignment(Number(req.params.id));
+A.post('/assignments/:id/reopen', async (req, res) => {
+  const a = await store.getAssignment(Number(req.params.id));
   if (!a) throw httpError(404, 'ไม่พบรายการ');
-  store.audit('admin', 'assignment.reopen', {
+  await store.audit('admin', 'assignment.reopen', {
     id: a.id, previous: { signer_name: a.signer_name, signed_at: a.signed_at, hash: a.hash, submitted_at: a.submitted_at },
   });
-  db.prepare(
+  await db.prepare(
     `UPDATE assignments SET status='draft', submitted_at=NULL, signer_name=NULL, signature=NULL, signed_at=NULL,
       sign_ip=NULL, sign_ua=NULL, hash=NULL, edited_after_sign=0 WHERE id=?`
   ).run(a.id);
   res.json({ ok: true });
 });
-A.post('/assignments/:id/regenerate-link', (req, res) => {
+A.post('/assignments/:id/regenerate-link', async (req, res) => {
   const tok = crypto.randomBytes(18).toString('base64url');
-  db.prepare('UPDATE assignments SET token=? WHERE id=?').run(tok, Number(req.params.id));
-  store.audit('admin', 'assignment.relink', { id: Number(req.params.id) });
+  await db.prepare('UPDATE assignments SET token=? WHERE id=?').run(tok, Number(req.params.id));
+  await store.audit('admin', 'assignment.relink', { id: Number(req.params.id) });
   res.json({ token: tok });
 });
 /** ผู้ดูแลแก้ไขคำตอบ — บันทึกค่าเดิมไว้ใน audit และทำเครื่องหมายว่าแก้ไขหลังลงนาม */
-A.put('/assignments/:id/response', (req, res) => {
-  const a = store.getAssignment(Number(req.params.id));
+A.put('/assignments/:id/response', async (req, res) => {
+  const a = await store.getAssignment(Number(req.params.id));
   if (!a) throw httpError(404, 'ไม่พบรายการ');
-  const inst = store.getInstrument(a.instrument_id);
-  const before = store.loadResponse(a);
-  store.tx(() => {
-    store.writeResponse(a, inst, req.body || {});
-    if (a.status === 'submitted') db.prepare('UPDATE assignments SET edited_after_sign=1 WHERE id=?').run(a.id);
+  const inst = await store.getInstrument(a.instrument_id);
+  const before = await store.loadResponse(a);
+  await store.tx(async () => {
+    await store.writeResponse(a, inst, req.body || {});
+    if (a.status === 'submitted') await db.prepare('UPDATE assignments SET edited_after_sign=1 WHERE id=?').run(a.id);
   });
-  store.audit('admin', 'response.edit', { id: a.id, reason: String(req.body?.reason || ''), before, after: store.loadResponse(a) });
+  const fresh = await store.getAssignment(a.id);
+  await store.audit('admin', 'response.edit', { id: a.id, reason: String(req.body?.reason || ''), before, after: await store.loadResponse(fresh) });
   res.json({ ok: true });
 });
 
 // ---------- results ----------
-function resultsFor(id) {
-  const inst = store.getInstrument(id);
+async function resultsFor(id) {
+  const inst = await store.getInstrument(id);
   if (!inst) throw httpError(404, 'ไม่พบแบบประเมิน');
-  const subs = store.submissionsFor(id);
-  const results = computeResults(inst, subs, store.getSettings());
+  const subs = await store.submissionsFor(id);
+  const results = computeResults(inst, subs, await store.getSettings());
   return { inst, subs, results };
 }
 /** รายชื่อผู้เชี่ยวชาญที่ลงนามส่งแล้ว พร้อมลายมือชื่อ (เรียงตามลำดับ “คนที่ 1, 2, …” เดียวกับตารางผล) */
@@ -581,7 +627,7 @@ function sendFile(res, buf, name, fmt) {
 }
 A.get('/instruments/:id/results.:fmt(docx|xlsx)', async (req, res, next) => {
   try {
-    const { inst, subs, results } = resultsFor(Number(req.params.id));
+    const { inst, subs, results } = await resultsFor(Number(req.params.id));
     if (!results.n) throw httpError(400, 'ยังไม่มีผู้ประเมินลงนามส่ง');
     const comments = collectComments(inst, subs);
     const fmt = req.params.fmt;
@@ -594,8 +640,8 @@ A.get('/instruments/:id/results.:fmt(docx|xlsx)', async (req, res, next) => {
     next(e);
   }
 });
-A.get('/instruments/:id/results', (req, res) => {
-  const { inst, subs, results } = resultsFor(Number(req.params.id));
+A.get('/instruments/:id/results', async (req, res) => {
+  const { inst, subs, results } = await resultsFor(Number(req.params.id));
   const comments = collectComments(inst, subs);
   const integrity = subs.map((s) => {
     const fresh = store.computeHash(s.row, inst, s);
@@ -614,8 +660,8 @@ function csv(rows) {
   return '﻿' + rows.map((r) => r.map(esc).join(',')).join('\r\n');
 }
 const f2 = (x) => (x === null || x === undefined ? '' : round2(x).toFixed(2));
-A.get('/instruments/:id/export.csv', (req, res) => {
-  const { inst, subs, results } = resultsFor(Number(req.params.id));
+A.get('/instruments/:id/export.csv', async (req, res) => {
+  const { inst, subs, results } = await resultsFor(Number(req.params.id));
   const type = req.query.type || 'summary';
   let rows = [];
   if (type === 'raw') {
@@ -697,13 +743,13 @@ A.get('/instruments/:id/export.csv', (req, res) => {
   res.send(csv(rows));
 });
 
-A.get('/audit', (req, res) =>
-  res.json(db.prepare('SELECT * FROM audit ORDER BY id DESC LIMIT ?').all(Math.min(Number(req.query.limit) || 300, 2000)))
+A.get('/audit', async (req, res) =>
+  res.json(await db.prepare('SELECT * FROM audit ORDER BY id DESC LIMIT ?').all(Math.min(Number(req.query.limit) || 300, 2000)))
 );
-A.get('/backup.json', (req, res) => {
+A.get('/backup.json', async (req, res) => {
   const tables = ['settings', 'instruments', 'sections', 'item_groups', 'items', 'experts', 'assignments', 'answers', 'section_comments', 'audit'];
   const out = {};
-  for (const t of tables) out[t] = db.prepare(`SELECT * FROM ${t}`).all();
+  for (const t of tables) out[t] = await db.prepare(`SELECT * FROM ${t}`).all();
   out.settings = out.settings.filter((r) => !['sessionSecret', 'adminPasswordHash'].includes(r.key));
   res.setHeader('Content-Disposition', `attachment; filename="backup-${new Date().toISOString().slice(0, 10)}.json"`);
   res.json(out);
@@ -712,10 +758,10 @@ A.get('/backup.json', (req, res) => {
 app.use('/api/admin', A);
 
 // ======================= EXPERT API =======================
-function expertPayload(a, adminView) {
-  const inst = store.getInstrument(a.instrument_id);
-  const e = db.prepare('SELECT * FROM experts WHERE id=?').get(a.expert_id);
-  const s = store.getSettings();
+async function expertPayload(a, adminView) {
+  const inst = await store.getInstrument(a.instrument_id);
+  const e = await db.prepare('SELECT * FROM experts WHERE id=?').get(a.expert_id);
+  const s = await store.getSettings();
   const profile = a.profile ? JSON.parse(a.profile) : { name: e.name, position: e.position, workplace: e.workplace, experience: e.experience };
   return {
     instrument: inst,
@@ -725,7 +771,7 @@ function expertPayload(a, adminView) {
     },
     status: a.status,
     profile,
-    response: store.loadResponse(a),
+    response: await store.loadResponse(a),
     signature: a.status === 'submitted'
       ? { name: a.signer_name, image: a.signature, signedAt: a.signed_at, hash: a.hash, editedAfterSign: !!a.edited_after_sign }
       : null,
@@ -734,42 +780,42 @@ function expertPayload(a, adminView) {
   };
 }
 /** ผู้เรียกเป็นเจ้าของลิงก์ (เข้าสู่ระบบเป็นผู้เชี่ยวชาญคนนั้น) หรือเป็นผู้ดูแล */
-function canUse(req, a) {
+async function canUse(req, a) {
   if (isAdmin(req)) return true;
-  const e = expertSession(req);
+  const e = await expertSession(req);
   return !!e && e.id === a.expert_id;
 }
-function tokenAssignment(req, { auth = true } = {}) {
-  const a = store.getAssignmentByToken(String(req.params.token));
+async function tokenAssignment(req, { auth = true } = {}) {
+  const a = await store.getAssignmentByToken(String(req.params.token));
   if (!a) throw httpError(404, 'ลิงก์ไม่ถูกต้องหรือถูกยกเลิกแล้ว');
-  const inst = db.prepare('SELECT active FROM instruments WHERE id=?').get(a.instrument_id);
+  const inst = await db.prepare('SELECT active FROM instruments WHERE id=?').get(a.instrument_id);
   if (!inst?.active && !isAdmin(req) && a.status !== 'submitted') throw httpError(403, 'แบบประเมินนี้ปิดรับการประเมินแล้ว');
-  if (auth && !canUse(req, a)) throw httpError(401, 'กรุณาเข้าสู่ระบบด้วยอีเมลหรือเบอร์โทรศัพท์และรหัสผ่านก่อน');
+  if (auth && !(await canUse(req, a))) throw httpError(401, 'กรุณาเข้าสู่ระบบด้วยอีเมลหรือเบอร์โทรศัพท์และรหัสผ่านก่อน');
   return a;
 }
-app.get('/api/e/:token', (req, res) => {
-  const a = tokenAssignment(req, { auth: false });
-  if (!canUse(req, a)) {
+app.get('/api/e/:token', async (req, res) => {
+  const a = await tokenAssignment(req, { auth: false });
+  if (!(await canUse(req, a))) {
     // ยังไม่ได้เข้าสู่ระบบ: ส่งเฉพาะข้อมูลสำหรับหน้าตั้งค่าบัญชี/เข้าสู่ระบบ (ไม่มีคำตอบ)
-    const e = db.prepare('SELECT name, email, phone, password_hash FROM experts WHERE id=?').get(a.expert_id);
-    const inst = db.prepare('SELECT title, subtitle FROM instruments WHERE id=?').get(a.instrument_id);
+    const e = await db.prepare('SELECT name, email, phone, password_hash FROM experts WHERE id=?').get(a.expert_id);
+    const inst = await db.prepare('SELECT title, subtitle FROM instruments WHERE id=?').get(a.instrument_id);
     return res.json({
       gate: true,
       account: { hasPassword: !!e.password_hash, name: e.name, email: e.email || '', phone: e.phone || '' },
       instrument: inst,
-      meta: { thesisTitle: store.getSettings().thesisTitle || '' },
+      meta: { thesisTitle: (await store.getSettings()).thesisTitle || '' },
     });
   }
   const admin = isAdmin(req) && req.query.admin === '1';
-  if (!admin && !a.opened_at) db.prepare("UPDATE assignments SET opened_at=CURRENT_TIMESTAMP WHERE id=?").run(a.id);
-  res.json(expertPayload(a, admin));
+  if (!admin && !a.opened_at) await db.prepare("UPDATE assignments SET opened_at=CURRENT_TIMESTAMP WHERE id=?").run(a.id);
+  res.json(await expertPayload(a, admin));
 });
 /** ผู้เชี่ยวชาญตั้งค่าบัญชีครั้งแรกจากลิงก์เฉพาะบุคคล: อีเมล + เบอร์โทร + รหัสผ่าน */
 /**
  * ตั้งค่าบัญชีผู้เชี่ยวชาญ (อีเมล + เบอร์โทร + รหัสผ่าน) — ใช้ทั้งจากลิงก์เฉพาะบุคคลและจากหน้าแรก
  * ตั้งได้ครั้งเดียว (บัญชีที่มีรหัสแล้วต้องให้ผู้ดูแลรีเซ็ต)
  */
-function setupAccount(e, b) {
+async function setupAccount(e, b) {
   if (e.password_hash) throw httpError(409, 'ท่านมีบัญชีแล้ว กรุณาเข้าสู่ระบบด้วยรหัสผ่าน (หากลืมรหัส กรุณาติดต่อผู้วิจัย)');
   const email = String(b.email || '').trim();
   const phone = String(b.phone || '').replace(/[\s-]/g, '');
@@ -779,54 +825,59 @@ function setupAccount(e, b) {
   if (pw.length < 8) throw httpError(400, 'รหัสผ่านต้องยาวอย่างน้อย 8 ตัวอักษร');
   if (pw !== String(b.confirm || '')) throw httpError(400, 'ยืนยันรหัสผ่านไม่ตรงกัน');
   if (!b.consent) throw httpError(400, 'กรุณาทำเครื่องหมายยินยอมการเก็บข้อมูล');
-  const clash = db
+  const clash = await db
     .prepare('SELECT id FROM experts WHERE id<>? AND password_hash IS NOT NULL AND (lower(trim(email))=? OR phone=?)')
     .get(e.id, email.toLowerCase(), phone);
   if (clash) throw httpError(409, 'อีเมลหรือเบอร์โทรศัพท์นี้ถูกใช้กับบัญชีอื่นแล้ว กรุณาติดต่อผู้วิจัย');
   const h = hashPassword(pw);
   // รหัสที่ผู้เชี่ยวชาญตั้งเองเป็นความลับของผู้เชี่ยวชาญ (ผู้ดูแลรีเซ็ตได้ แต่ดูไม่ได้)
-  db.prepare('UPDATE experts SET email=?, phone=?, password_hash=?, password_enc=NULL WHERE id=?').run(email, phone, h, e.id);
+  // เงื่อนไข password_hash IS NULL กันการตั้งซ้ำพร้อมกันสองคำขอ
+  const r = await db
+    .prepare('UPDATE experts SET email=?, phone=?, password_hash=?, password_enc=NULL WHERE id=? AND password_hash IS NULL')
+    .run(email, phone, h, e.id);
+  if (!r.changes) throw httpError(409, 'ท่านมีบัญชีแล้ว กรุณาเข้าสู่ระบบด้วยรหัสผ่าน (หากลืมรหัส กรุณาติดต่อผู้วิจัย)');
   return { email, phone, hash: h };
 }
-app.post('/api/e/:token/account', (req, res) => {
+app.post('/api/e/:token/account', async (req, res) => {
   const t = throttle(req, res);
   if (!t) return;
-  const a = tokenAssignment(req, { auth: false });
-  const e = db.prepare('SELECT * FROM experts WHERE id=?').get(a.expert_id);
-  const r = setupAccount(e, req.body || {});
-  db.prepare('UPDATE experts SET last_login=CURRENT_TIMESTAMP WHERE id=?').run(e.id);
+  const a = await tokenAssignment(req, { auth: false });
+  const e = await db.prepare('SELECT * FROM experts WHERE id=?').get(a.expert_id);
+  const r = await setupAccount(e, req.body || {});
+  await db.prepare('UPDATE experts SET last_login=CURRENT_TIMESTAMP WHERE id=?').run(e.id);
   t.ok();
   const secure = req.secure ? '; Secure' : '';
   res.setHeader('Set-Cookie', `exs=${encodeURIComponent(makeExpertSession(e.id, r.hash))}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_HOURS * 3600}${secure}`);
-  store.audit('expert', 'expert.account.setup', { id: e.id, name: e.name, email: r.email, via: 'link', ip: req.ip });
+  await store.audit('expert', 'expert.account.setup', { id: e.id, name: e.name, email: r.email, via: 'link', ip: req.ip });
   res.json({ ok: true });
 });
 
 // ---------- ลงทะเบียนจากหน้าแรก: เลือกชื่อ → กรอกอีเมล เบอร์โทร รหัสผ่าน → บันทึก → เข้าสู่ระบบอีกครั้ง ----------
 /** รายชื่อผู้เชี่ยวชาญที่ยังไม่มีบัญชี (ชื่อที่ลงทะเบียนแล้วจะไม่แสดง) */
-app.get('/api/public/experts', (req, res) => {
-  res.json(db.prepare('SELECT id, name FROM experts WHERE password_hash IS NULL ORDER BY name').all());
+app.get('/api/public/experts', async (req, res) => {
+  res.json(await db.prepare('SELECT id, name FROM experts WHERE password_hash IS NULL ORDER BY name').all());
 });
-app.post('/api/public/register', (req, res) => {
+app.post('/api/public/register', async (req, res) => {
   const t = throttle(req, res);
   if (!t) return;
   const b = req.body || {};
-  const e = db.prepare('SELECT * FROM experts WHERE id=?').get(Number(b.expertId));
+  const e = await db.prepare('SELECT * FROM experts WHERE id=?').get(Number(b.expertId));
   if (!e) {
     t.fail();
     throw httpError(400, 'กรุณาเลือกชื่อของท่านจากรายการ');
   }
-  const r = setupAccount(e, b);
+  const r = await setupAccount(e, b);
   t.ok();
-  store.audit('expert', 'expert.account.setup', { id: e.id, name: e.name, email: r.email, via: 'register', ip: req.ip });
+  await store.audit('expert', 'expert.account.setup', { id: e.id, name: e.name, email: r.email, via: 'register', ip: req.ip });
   res.json({ ok: true, login: r.email });
 });
 /** ดาวน์โหลดแบบประเมินที่กรอกแล้วเป็น Word / Excel (ผู้เชี่ยวชาญและผู้ดูแล) */
 app.get('/api/e/:token/form.:fmt(docx|xlsx)', async (req, res, next) => {
   try {
-    const a = tokenAssignment(req);
-    const p = expertPayload(a, false);
-    const args = { inst: p.instrument, meta: p.meta, profile: p.profile, response: p.response, signature: p.signature, status: p.status, uploadDir: store.UPLOAD_DIR };
+    const a = await tokenAssignment(req);
+    const p = await expertPayload(a, false);
+    const att = p.instrument.attachment ? await store.getFile(p.instrument.attachment) : null;
+    const args = { inst: p.instrument, meta: p.meta, profile: p.profile, response: p.response, signature: p.signature, status: p.status, attachmentData: att?.data };
     const fmt = req.params.fmt;
     const buf = fmt === 'docx' ? await exporter.formDocx(args) : await exporter.formXlsx(args);
     sendFile(res, buf, `ชุดที่ ${p.instrument.code || p.instrument.id} ${p.profile.name || 'ผู้ประเมิน'}`, fmt);
@@ -834,21 +885,24 @@ app.get('/api/e/:token/form.:fmt(docx|xlsx)', async (req, res, next) => {
     next(e);
   }
 });
-app.put('/api/e/:token/draft', (req, res) => {
-  const a = tokenAssignment(req);
+app.put('/api/e/:token/draft', async (req, res) => {
+  const a = await tokenAssignment(req);
   if (a.status === 'submitted') throw httpError(409, 'ท่านลงนามส่งแบบประเมินแล้ว หากต้องการแก้ไขกรุณาติดต่อผู้วิจัย');
-  const inst = store.getInstrument(a.instrument_id);
-  store.tx(() => {
-    store.writeResponse(a, inst, req.body || {});
-    db.prepare("UPDATE assignments SET status='draft' WHERE id=?").run(a.id);
+  const inst = await store.getInstrument(a.instrument_id);
+  await store.tx(async () => {
+    // ตรวจสถานะซ้ำในธุรกรรม กันร่างที่ส่งช้ามาเขียนทับฉบับที่ลงนามแล้ว
+    const cur = await store.getAssignment(a.id);
+    if (cur.status === 'submitted') throw httpError(409, 'ท่านลงนามส่งแบบประเมินแล้ว หากต้องการแก้ไขกรุณาติดต่อผู้วิจัย');
+    await store.writeResponse(a, inst, req.body || {});
+    await db.prepare("UPDATE assignments SET status='draft' WHERE id=?").run(a.id);
   });
   res.json({ ok: true, savedAt: new Date().toISOString() });
 });
-app.post('/api/e/:token/submit', (req, res) => {
-  const a = tokenAssignment(req);
+app.post('/api/e/:token/submit', async (req, res) => {
+  const a = await tokenAssignment(req);
   if (a.status === 'submitted') throw httpError(409, 'ท่านลงนามส่งแบบประเมินแล้ว');
   const b = req.body || {};
-  const inst = store.getInstrument(a.instrument_id);
+  const inst = await store.getInstrument(a.instrument_id);
   const signerName = String(b.signerName || '').trim();
   const sig = String(b.signature || '');
   if (!b.consent) throw httpError(400, 'กรุณายืนยันการลงนามอิเล็กทรอนิกส์');
@@ -857,13 +911,16 @@ app.post('/api/e/:token/submit', (req, res) => {
   if (!String(b.profile?.name || '').trim()) throw httpError(400, 'กรุณากรอกชื่อผู้ประเมินในตอนที่ 1');
 
   // บันทึกคำตอบเป็นร่างก่อน เพื่อไม่ให้ข้อมูลหายหากตรวจแล้วยังไม่ครบ
-  store.tx(() => {
-    store.writeResponse(a, inst, b);
-    db.prepare("UPDATE assignments SET status='draft' WHERE id=?").run(a.id);
+  await store.tx(async () => {
+    const cur = await store.getAssignment(a.id);
+    if (cur.status === 'submitted') throw httpError(409, 'ท่านลงนามส่งแบบประเมินแล้ว');
+    await store.writeResponse(a, inst, b);
+    await db.prepare("UPDATE assignments SET status='draft' WHERE id=?").run(a.id);
   });
-  store.tx(() => {
-    const fresh = store.getAssignment(a.id);
-    const resp = store.loadResponse(fresh);
+  await store.tx(async () => {
+    const fresh = await store.getAssignment(a.id);
+    if (fresh.status === 'submitted') throw httpError(409, 'ท่านลงนามส่งแบบประเมินแล้ว');
+    const resp = await store.loadResponse(fresh);
     const missing = store.missingAnswers(inst, resp.answers);
     if (missing.length) {
       const e = httpError(400, `ยังประเมินไม่ครบ ${missing.length} ข้อ: ${missing.slice(0, 6).map((m) => m.label).join(', ')}${missing.length > 6 ? ' …' : ''}`);
@@ -871,15 +928,15 @@ app.post('/api/e/:token/submit', (req, res) => {
       throw e;
     }
     const signedAt = new Date().toISOString();
-    db.prepare(
+    await db.prepare(
       `UPDATE assignments SET status='submitted', submitted_at=?, signer_name=?, signature=?, signed_at=?, sign_ip=?, sign_ua=?, edited_after_sign=0 WHERE id=?`
     ).run(signedAt, signerName.slice(0, 200), sig, signedAt, req.ip, String(req.headers['user-agent'] || '').slice(0, 300), a.id);
-    const signed = store.getAssignment(a.id);
-    const hash = store.computeHash(signed, inst, store.loadResponse(signed));
-    db.prepare('UPDATE assignments SET hash=? WHERE id=?').run(hash, a.id);
-    store.audit('expert', 'submit', { assignmentId: a.id, signer: signerName, ip: req.ip, hash });
+    const signed = await store.getAssignment(a.id);
+    const hash = store.computeHash(signed, inst, await store.loadResponse(signed));
+    await db.prepare('UPDATE assignments SET hash=? WHERE id=?').run(hash, a.id);
+    await store.audit('expert', 'submit', { assignmentId: a.id, signer: signerName, ip: req.ip, hash });
   });
-  res.json(expertPayload(store.getAssignment(a.id), false));
+  res.json(await expertPayload(await store.getAssignment(a.id), false));
 });
 
 // ---------- errors ----------
@@ -891,8 +948,11 @@ app.use((err, req, res, next) => {
 });
 
 if (require.main === module) {
-  app.listen(PORT, () => {
-    console.log(`ระบบประเมินเครื่องมือวิจัย พร้อมใช้งานที่ http://localhost:${PORT}/admin`);
-  });
+  ready.then(() =>
+    app.listen(PORT, () => {
+      console.log(`ระบบประเมินเครื่องมือวิจัย พร้อมใช้งานที่ http://localhost:${PORT}/admin  (ฐานข้อมูล: ${store.IS_LOCAL ? 'ไฟล์ในเครื่อง' : 'Turso'})`);
+    })
+  );
 }
+app.ready = ready;
 module.exports = app;
